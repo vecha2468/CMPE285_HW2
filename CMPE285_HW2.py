@@ -2,26 +2,28 @@
 """
 CMPE285_HW2.py
 ----------------------------------
-Fetches live stock data using the Alpha Vantage API.
-Works both locally and on Streamlit Cloud.
+Backend logic for fetching live stock information using Yahoo Finance (via yfinance).
+Optimized for Streamlit Cloud.
 """
 
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Optional
 import sys
-import requests
-import os
 import pandas as pd
+import yfinance as yf
+import requests_cache
 
-# ✅ Alpha Vantage API key (you can also store it as an environment variable)
-ALPHA_KEY = os.getenv("ALPHAVANTAGE_API_KEY", "PM0UVH844BWE9QWF")
+# ✅ Caching session to stabilize yfinance on Streamlit Cloud
+session = requests_cache.CachedSession("/tmp/yf_cache", expire_after=3600)
+yf.utils.get_yf_session = lambda: session
 
-# ✅ Optional timezone support
+# ✅ Optional timezone support (safe fallback)
 try:
     from zoneinfo import ZoneInfo
 except ImportError:
     ZoneInfo = None
+
 TZ = ZoneInfo("America/Los_Angeles") if ZoneInfo else None
 
 
@@ -38,57 +40,78 @@ class Quote:
 
 
 class QuoteError(Exception):
-    """Raised when there’s an issue fetching stock data."""
+    """Raised when there’s an issue fetching the stock quote."""
 
 
 # -----------------------------
 # Helper functions
 # -----------------------------
 def format_timestamp(dt: Optional[datetime] = None) -> str:
-    """Format current timestamp nicely."""
+    """Format the current timestamp nicely."""
     dt = dt or (datetime.now(TZ) if TZ else datetime.now())
     return dt.strftime("%a %b %d %H:%M:%S %Z %Y").strip()
 
 
-def fetch_alpha_vantage(symbol: str) -> tuple[str, float, float]:
-    """Fetch company name, last price, and previous close using Alpha Vantage."""
+def _get_name_safe(ticker: yf.Ticker, symbol: str) -> str:
+    """Safely extract company name."""
     try:
-        symbol = symbol.upper()
-        url = f"https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol={symbol}&apikey={ALPHA_KEY}"
-        r = requests.get(url, timeout=10)
-        r.raise_for_status()
-        data = r.json()
-        quote = data.get("Global Quote", {})
-        if not quote:
-            raise QuoteError("No valid data returned from Alpha Vantage.")
+        info = ticker.get_info()
+        return info.get("longName") or info.get("shortName") or symbol.upper()
+    except Exception:
+        return symbol.upper()
 
-        company = symbol  # Alpha Vantage doesn’t return full name; symbol as fallback
-        last_price = float(quote.get("05. price", 0))
-        prev_close = float(quote.get("08. previous close", 0))
-        if last_price == 0 or prev_close == 0:
-            raise QuoteError("Incomplete data from Alpha Vantage.")
-        return company, last_price, prev_close
+
+def _get_prices_safe(ticker: yf.Ticker) -> tuple[float, float]:
+    """
+    Fetch reliable last price and previous close using yf.download(),
+    which works better in Streamlit Cloud.
+    """
+    try:
+        import datetime as dt
+        end = dt.datetime.now()
+        start = end - dt.timedelta(days=10)
+        data = yf.download(ticker.ticker, start=start, end=end, progress=False)
+
+        if data.empty or "Close" not in data.columns:
+            raise QuoteError("No valid price data found.")
+
+        last_price = float(data["Close"].iloc[-1])
+        if len(data) >= 2:
+            prev_close = float(data["Close"].iloc[-2])
+        else:
+            prev_close = last_price
+
+        return last_price, prev_close
+
     except Exception as e:
         raise QuoteError(f"No valid price data found. ({e})")
 
 
+
 # -----------------------------
-# Main fetch function
+# Core function
 # -----------------------------
 def fetch_quote(symbol: str) -> Quote:
-    """Fetch stock quote using Alpha Vantage API."""
+    """Fetch stock quote given a symbol."""
     if not symbol or not symbol.strip():
         raise QuoteError("Stock symbol cannot be empty.")
     symbol = symbol.strip().upper()
 
-    company, last_price, prev_close = fetch_alpha_vantage(symbol)
+    try:
+        ticker = yf.Ticker(symbol)
+        company_name = _get_name_safe(ticker, symbol)
+        last_price, prev_close = _get_prices_safe(ticker)
+    except QuoteError as qe:
+        raise qe
+    except Exception as e:
+        raise QuoteError(f"Error retrieving data for {symbol}: {e}")
 
     change = last_price - prev_close
     percent = (change / prev_close * 100) if prev_close != 0 else 0
 
     return Quote(
         symbol=symbol,
-        company=f"{company} ({symbol})",
+        company=f"{company_name} ({symbol})",
         price=round(last_price, 2),
         change=round(change, 2),
         percent=round(percent, 2),
@@ -96,10 +119,10 @@ def fetch_quote(symbol: str) -> Quote:
 
 
 # -----------------------------
-# For testing / CLI use
+# Utility for CLI testing
 # -----------------------------
 def render_quote(q: Quote) -> str:
-    """Format quote nicely for display."""
+    """Nicely format the stock quote output."""
     sign_change = "+" if q.change > 0 else "-" if q.change < 0 else ""
     sign_pct = "+" if q.percent > 0 else "-" if q.percent < 0 else ""
     return (
