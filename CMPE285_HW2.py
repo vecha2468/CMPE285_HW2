@@ -1,46 +1,35 @@
 #!/usr/bin/env python3
 """
-stock_quote.py
+CMPE285_HW2.py
 ----------------------------------
-A small CLI tool to fetch live stock info (company name, price, change, % change)
-using Yahoo Finance via the `yfinance` library.
-
-Example:
-    Please enter a symbol:
-    ADBE
-
-Output:
-    Mon Oct 10 17:23:48 PDT 2016
-
-    Adobe Systems Incorporated (ADBE)
-
-    109.24 +0.60 (+0.55%)
-
-Features:
-- No API key required
-- Handles invalid symbols and network errors gracefully
-- Runs fully in terminal or PyCharm console
+Backend logic for fetching live stock information using Yahoo Finance (via yfinance).
+Optimized for Streamlit Cloud.
 """
 
-from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Optional
-
 import sys
-import yfinance as yf
 import pandas as pd
+import yfinance as yf
+import requests_cache
 
+# ✅ Caching session to stabilize yfinance on Streamlit Cloud
+session = requests_cache.CachedSession("/tmp/yf_cache", expire_after=3600)
+yf.utils.get_yf_session = lambda: session
+
+# ✅ Optional timezone support (safe fallback)
 try:
     from zoneinfo import ZoneInfo
 except ImportError:
     ZoneInfo = None
 
-
-# Set timezone (Pacific Time)
 TZ = ZoneInfo("America/Los_Angeles") if ZoneInfo else None
 
 
+# -----------------------------
+# Data structures and exceptions
+# -----------------------------
 @dataclass
 class Quote:
     symbol: str
@@ -51,17 +40,20 @@ class Quote:
 
 
 class QuoteError(Exception):
-    """Custom exception for quote retrieval errors."""
+    """Raised when there’s an issue fetching the stock quote."""
 
 
+# -----------------------------
+# Helper functions
+# -----------------------------
 def format_timestamp(dt: Optional[datetime] = None) -> str:
-    """Format timestamp like: Mon Oct 10 17:23:48 PDT 2016"""
+    """Format the current timestamp nicely."""
     dt = dt or (datetime.now(TZ) if TZ else datetime.now())
     return dt.strftime("%a %b %d %H:%M:%S %Z %Y").strip()
 
 
 def _get_name_safe(ticker: yf.Ticker, symbol: str) -> str:
-    """Safely get company name."""
+    """Safely extract company name."""
     try:
         info = ticker.get_info()
         return info.get("longName") or info.get("shortName") or symbol.upper()
@@ -70,51 +62,63 @@ def _get_name_safe(ticker: yf.Ticker, symbol: str) -> str:
 
 
 def _get_prices_safe(ticker: yf.Ticker) -> tuple[float, float]:
-    """Return (last_price, previous_close) safely."""
+    """
+    Fetch reliable last price and previous close for the ticker.
+    Uses cached Yahoo session to avoid throttling issues.
+    """
     try:
-        fi = ticker.fast_info
-        last_price = float(fi.get("last_price"))
-        prev_close = float(fi.get("previous_close"))
-        if pd.notna(last_price) and pd.notna(prev_close):
-            return last_price, prev_close
-    except Exception:
-        pass
+        # Try 5 days of data to ensure at least 2 valid rows
+        hist = ticker.history(period="5d", interval="1d", auto_adjust=False)
+        hist = hist.dropna(how="all")
+        if hist.empty or "Close" not in hist.columns:
+            raise QuoteError("No valid price data found.")
 
-    # Fallback to historical data
-    hist = ticker.history(period="5d", interval="1d")
-    if hist.empty or "Close" not in hist.columns:
-        raise QuoteError("No valid price data found.")
-    last_price = float(hist["Close"].iloc[-1])
-    prev_close = float(hist["Close"].iloc[-2]) if len(hist) >= 2 else last_price
-    return last_price, prev_close
+        last_price = float(hist["Close"].iloc[-1])
+        if len(hist) >= 2:
+            prev_close = float(hist["Close"].iloc[-2])
+        else:
+            prev_close = float(hist["Open"].iloc[-1])
+        return last_price, prev_close
+
+    except Exception as e:
+        raise QuoteError(f"No valid price data found. ({e})")
 
 
+# -----------------------------
+# Core function
+# -----------------------------
 def fetch_quote(symbol: str) -> Quote:
-    """Main function to fetch and return a stock quote."""
-    if not symbol.strip():
-        raise QuoteError("Symbol cannot be empty.")
+    """Fetch stock quote given a symbol."""
+    if not symbol or not symbol.strip():
+        raise QuoteError("Stock symbol cannot be empty.")
     symbol = symbol.strip().upper()
 
     try:
         ticker = yf.Ticker(symbol)
         company_name = _get_name_safe(ticker, symbol)
         last_price, prev_close = _get_prices_safe(ticker)
+    except QuoteError as qe:
+        raise qe
     except Exception as e:
-        raise QuoteError(f"Unable to retrieve data: {e}")
+        raise QuoteError(f"Error retrieving data for {symbol}: {e}")
 
     change = last_price - prev_close
-    percent = (change / prev_close) * 100 if prev_close != 0 else 0
+    percent = (change / prev_close * 100) if prev_close != 0 else 0
+
     return Quote(
         symbol=symbol,
         company=f"{company_name} ({symbol})",
         price=round(last_price, 2),
         change=round(change, 2),
-        percent=round(percent, 2)
+        percent=round(percent, 2),
     )
 
 
+# -----------------------------
+# Utility for CLI testing
+# -----------------------------
 def render_quote(q: Quote) -> str:
-    """Pretty-print a quote object."""
+    """Nicely format the stock quote output."""
     sign_change = "+" if q.change > 0 else "-" if q.change < 0 else ""
     sign_pct = "+" if q.percent > 0 else "-" if q.percent < 0 else ""
     return (
@@ -124,28 +128,18 @@ def render_quote(q: Quote) -> str:
     )
 
 
-def main():
-    print("Please enter a symbol:")
-    try:
-        for line in sys.stdin:
-            symbol = line.strip()
-            if not symbol:
-                print("Goodbye!")
-                break
-            try:
-                q = fetch_quote(symbol)
-                print(render_quote(q))
-            except QuoteError as qe:
-                print(f"Error: {qe}\n")
-            except Exception as e:
-                print(f"Unexpected error: {e}\n")
-            finally:
-                print("Please enter a symbol:")
-    except KeyboardInterrupt:
-        print("\nInterrupted by user.")
-
-
 if __name__ == "__main__":
-    main()
-
-# See PyCharm help at https://www.jetbrains.com/help/pycharm/
+    print("Enter a stock symbol:")
+    for line in sys.stdin:
+        symbol = line.strip()
+        if not symbol:
+            print("Goodbye!")
+            break
+        try:
+            q = fetch_quote(symbol)
+            print(render_quote(q))
+        except QuoteError as e:
+            print(f"Error: {e}\n")
+        except Exception as e:
+            print(f"Unexpected error: {e}\n")
+        print("Enter a stock symbol:")
