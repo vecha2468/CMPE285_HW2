@@ -63,25 +63,29 @@ def _get_name_safe(ticker: yf.Ticker, symbol: str) -> str:
 
 def _get_prices_safe(ticker: yf.Ticker) -> tuple[float, float]:
     """
-    Fetch reliable last price and previous close for the ticker.
-    Uses cached Yahoo session to avoid throttling issues.
+    Fetch reliable last price and previous close using yf.download(),
+    which works better in Streamlit Cloud.
     """
     try:
-        # Try 5 days of data to ensure at least 2 valid rows
-        hist = ticker.history(period="5d", interval="1d", auto_adjust=False)
-        hist = hist.dropna(how="all")
-        if hist.empty or "Close" not in hist.columns:
+        import datetime as dt
+        end = dt.datetime.now()
+        start = end - dt.timedelta(days=10)
+        data = yf.download(ticker.ticker, start=start, end=end, progress=False)
+
+        if data.empty or "Close" not in data.columns:
             raise QuoteError("No valid price data found.")
 
-        last_price = float(hist["Close"].iloc[-1])
-        if len(hist) >= 2:
-            prev_close = float(hist["Close"].iloc[-2])
+        last_price = float(data["Close"].iloc[-1])
+        if len(data) >= 2:
+            prev_close = float(data["Close"].iloc[-2])
         else:
-            prev_close = float(hist["Open"].iloc[-1])
+            prev_close = last_price
+
         return last_price, prev_close
 
     except Exception as e:
         raise QuoteError(f"No valid price data found. ({e})")
+
 
 
 # -----------------------------
